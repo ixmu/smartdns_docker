@@ -1,0 +1,67 @@
+name: Update Domain List
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: 0 */4 * * *
+
+jobs:
+  Smartdns-GFWList:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Smartdns GFWList
+        run: |
+          # GFW List
+          curl -sS https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt | \
+              base64 -d | sort -u | sed '/^$\|@@/d'| sed 's#!.\+##; s#|##g; s#@##g; s#http:\/\/##; s#https:\/\/##;' | \
+              sed '/apple\.com/d; /sina\.cn/d; /sina\.com\.cn/d; /baidu\.com/d; /qq\.com/d' | \
+              sed '/^[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+$/d' | grep '^[0-9a-zA-Z\.-]\+$' | \
+              grep '\.' | sed 's#^\.\+##' | sort -u > /tmp/temp_gfwlist1
+          curl -sS https://raw.githubusercontent.com/hq450/fancyss/master/rules/gfwlist.conf | \
+              sed 's/ipset=\/\.//g; s/\/gfwlist//g; /^server/d' > /tmp/temp_gfwlist2
+          curl -sS https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt > /tmp/temp_gfwlist3
+          cat /tmp/temp_gfwlist1 /tmp/temp_gfwlist2 /tmp/temp_gfwlist3  | \
+              sort -u | sed 's/^\.*//g' | sed -e '/^$/d' > proxy-domain-list.conf
+          
+          # Update China List
+          accelerated_domains="$(curl -kLfsm 5 https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/accelerated-domains.china.conf)"
+          apple_china="$(curl -kLfsm 5 https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/refs/heads/master/apple.china.conf)"
+          google_china="$(curl -kLfsm 5 https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/refs/heads/master/google.china.conf)"
+          
+          domain_list="$accelerated_domains\n$apple_china\n$google_china"
+          echo -e "${domain_list}" | sort | uniq |sed -e 's/#.*//g' -e '/^$/d' -e 's/server=\///g' -e 's/\/114.114.114.114//g' | sort -u >direct-domain-list.conf
+          
+          mkdir -p /tmp/domain-lists
+          cp direct-domain-list.conf proxy-domain-list.conf /tmp/domain-lists/
+
+      - name: Push to main branch
+        run: |
+          git config user.name "Action Bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          # 切换到 main 分支
+          git checkout main
+          
+          # 拉取远程最新更改
+          git pull origin main --rebase || echo "Pull failed, continuing with local changes"
+          
+          # 复制生成的文件到当前目录
+          cp /tmp/domain-lists/direct-domain-list.conf .
+          cp /tmp/domain-lists/proxy-domain-list.conf .
+          
+          git add direct-domain-list.conf proxy-domain-list.conf
+          
+          # 检查是否有更改需要提交
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update domain lists $(date '+%Y-%m-%d %H:%M:%S')"
+            # 推送到 main 分支
+            git push origin main
+          fi
