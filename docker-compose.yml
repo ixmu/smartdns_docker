@@ -1,0 +1,19 @@
+version: "3.8"
+
+services:
+  smartdns:
+    build: .
+    image: smartdns:alpine
+    container_name: smartdns
+    restart: unless-stopped
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+    volumes:
+      - ./etc/smartdns:/etc/smartdns
+      # Fedora/RHEL/CentOS 等启用 SELinux 的系统上用 podman 时，改成:
+      # - ./etc/smartdns:/etc/smartdns:Z
+    # 如需容器直接使用宿主网络（部分场景更稳定），可替换为:
+    # network_mode: host
+
+# 本文件同时兼容 `docker compose` 和 `podman compose` / podman-compose，无需修改。

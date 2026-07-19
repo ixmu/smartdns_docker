@@ -1,0 +1,49 @@
+# Podman Quadlet 单元文件
+# 用于替代 `docker run --restart unless-stopped`：Docker 靠 dockerd 常驻进程实现开机自启/崩溃重启，
+# Podman 没有常驻 daemon，因此持久化/自启需要交给 systemd 管理，Quadlet 是目前官方推荐的方式
+# （Podman 4.4+ / 5.x 自带）。
+#
+# ------------------- 安装方法 -------------------
+#
+# 【rootful，系统级，推荐——因为要监听 53 特权端口】
+#   sudo mkdir -p /etc/containers/systemd
+#   sudo cp smartdns.container /etc/containers/systemd/
+#   # 把下面 Volume= 那一行的路径改成你实际的 etc/smartdns 绝对路径
+#   sudo systemctl daemon-reload
+#   sudo systemctl start smartdns.service
+#   sudo systemctl status smartdns.service
+#   journalctl -u smartdns.service -f
+#
+# 【rootless，用户级——需要先解决 53 端口的非特权绑定，见 README】
+#   mkdir -p ~/.config/containers/systemd
+#   cp smartdns.container ~/.config/containers/systemd/
+#   systemctl --user daemon-reload
+#   systemctl --user start smartdns.service
+#   # 如果希望用户登出后容器依然常驻，需要额外执行一次：
+#   loginctl enable-linger $(whoami)
+#
+# 修改配置后只需要 systemctl restart smartdns.service，不需要重新生成 Quadlet 文件。
+# 更新镜像后（build.sh 跑完），同样 systemctl restart smartdns.service 即可生效。
+
+[Unit]
+Description=SmartDNS (Alpine, static binary)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/smartdns:alpine
+ContainerName=smartdns
+
+PublishPort=53:53/udp
+PublishPort=53:53/tcp
+
+# 把 /path/to/smartdns-docker 换成本项目实际所在的绝对路径
+# SELinux 系统（Fedora/RHEL/CentOS）建议加 :Z 后缀，例如 .../etc/smartdns:/etc/smartdns:Z
+Volume=/path/to/smartdns-docker/etc/smartdns:/etc/smartdns
+
+[Service]
+Restart=always
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target default.target
