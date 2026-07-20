@@ -52,10 +52,10 @@ jobs:
           git pull origin main --rebase || echo "Pull failed, continuing with local changes"
           
           # 复制生成的文件到当前目录
-          cp /tmp/domain-lists/direct-domain-list.conf .
-          cp /tmp/domain-lists/proxy-domain-list.conf .
+          cp -f /tmp/domain-lists/direct-domain-list.conf ./smartdns/
+          cp -f /tmp/domain-lists/proxy-domain-list.conf ./smartdns/
           
-          git add direct-domain-list.conf proxy-domain-list.conf
+          git add smartdns/direct-domain-list.conf smartdns/proxy-domain-list.conf
           
           # 检查是否有更改需要提交
           if git diff --staged --quiet; then
