@@ -1,0 +1,130 @@
+name: Build and Push SmartDNS Docker Image
+
+on:
+  # 手动触发，可选择性指定要编译的版本 tag（留空则自动获取官方最新 Release）
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "手动指定 SmartDNS 版本 tag（如 Release48.2），留空则自动获取最新 Release"
+        required: false
+        default: ""
+
+  # 定时触发：每周一次（近似每 7 天），每周日 00:00 UTC
+  schedule:
+    - cron: "0 0 * * 0"
+
+env:
+  UPSTREAM_REPO: pymumu/smartdns
+  IMAGE_NAME: smartdns
+  LAST_VERSION_FILE: .github/state/last_version.txt
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout docker repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine SmartDNS version to build
+        id: ver
+        env:
+          MANUAL_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -e
+          mkdir -p "$(dirname "$LAST_VERSION_FILE")"
+
+          VERSION=""
+
+          if [ -n "$MANUAL_VERSION" ]; then
+            VERSION="$MANUAL_VERSION"
+            echo "使用手动指定版本: $VERSION"
+          else
+            echo "正在查询 ${UPSTREAM_REPO} 最新 Release..."
+            API_RESPONSE="$(curl -fsSL \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" || true)"
+
+            VERSION="$(printf '%s' "$API_RESPONSE" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/' || true)"
+
+            if [ -z "$VERSION" ]; then
+              echo "::warning::获取最新 Release 失败或未发布新版本，尝试沿用上一次成功构建的版本"
+              if [ -f "$LAST_VERSION_FILE" ]; then
+                VERSION="$(cat "$LAST_VERSION_FILE")"
+                echo "沿用上一次版本: $VERSION"
+              fi
+            else
+              echo "获取到最新版本: $VERSION"
+            fi
+          fi
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::无法确定 SmartDNS 版本号，且没有可用的历史版本记录，终止构建"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Clone SmartDNS source (${{ steps.ver.outputs.version }})
+        run: |
+          set -e
+          rm -rf src
+          git clone --depth 1 --branch "${{ steps.ver.outputs.version }}" \
+            "https://github.com/${UPSTREAM_REPO}.git" src
+
+      - name: Inject Dockerfile and preset config into build context
+        run: |
+          set -e
+          cp Dockerfile src/Dockerfile
+          rm -rf src/smartdns
+          cp -r smartdns src/smartdns
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push (linux/amd64, linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: src
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            SMARTDNS_VERSION=${{ steps.ver.outputs.version }}
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.version }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Record last built version
+        run: |
+          echo -n "${{ steps.ver.outputs.version }}" > "$LAST_VERSION_FILE"
+
+      - name: Commit version record back to repo
+        run: |
+          set -e
+          git config user.name "Action Bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "$LAST_VERSION_FILE"
+
+          if git diff --staged --quiet; then
+            echo "版本记录无变化，跳过提交"
+          else
+            git commit -m "chore: update last built smartdns version to ${{ steps.ver.outputs.version }}"
+            git fetch origin main
+            git rebase origin/main
+            git push origin HEAD:main
+          fi
