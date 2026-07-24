@@ -1,15 +1,12 @@
 name: Build and Push SmartDNS Docker Image
 
 on:
-  # 手动触发，可选择性指定要编译的版本 tag（留空则自动获取官方最新 Release）
   workflow_dispatch:
     inputs:
       version:
         description: "手动指定 SmartDNS 版本 tag（如 Release48.2），留空则自动获取最新 Release"
         required: false
         default: ""
-
-  # 定时触发：每周一次，每周日 00:00 UTC
   schedule:
     - cron: "0 0 * * 0"
 
@@ -19,83 +16,75 @@ env:
   LAST_VERSION_FILE: .github/state/last_version.txt
 
 jobs:
-  build-and-push:
+  # 步骤 1：确定版本号
+  prepare:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      packages: write # 授权写权限，以便将镜像推送到 GHCR
-
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
     steps:
       - name: Checkout docker repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Determine SmartDNS version to build
+      - name: Determine SmartDNS version
         id: ver
         env:
           MANUAL_VERSION: ${{ github.event.inputs.version }}
         run: |
           set -e
           mkdir -p "$(dirname "$LAST_VERSION_FILE")"
-
           VERSION=""
-
           if [ -n "$MANUAL_VERSION" ]; then
             VERSION="$MANUAL_VERSION"
-            echo "使用手动指定版本: $VERSION"
           else
-            echo "正在查询 ${UPSTREAM_REPO} 最新 Release..."
             API_RESPONSE="$(curl -fsSL \
               -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" || true)"
-
             VERSION="$(printf '%s' "$API_RESPONSE" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/' || true)"
-
-            if [ -z "$VERSION" ]; then
-              echo "::warning::获取最新 Release 失败或未发布新版本，尝试沿用上一次成功构建的版本"
-              if [ -f "$LAST_VERSION_FILE" ]; then
-                VERSION="$(cat "$LAST_VERSION_FILE")"
-                echo "沿用上一次版本: $VERSION"
-              fi
-            else
-              echo "获取到最新版本: $VERSION"
+            if [ -z "$VERSION" ] && [ -f "$LAST_VERSION_FILE" ]; then
+              VERSION="$(cat "$LAST_VERSION_FILE")"
             fi
           fi
-
           if [ -z "$VERSION" ]; then
-            echo "::error::无法确定 SmartDNS 版本号，且没有可用的历史版本记录，终止构建"
             exit 1
           fi
-
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Clone SmartDNS source (${{ steps.ver.outputs.version }})
+  # 步骤 2：使用原生机器分别构建 amd64 和 arm64 架构（速度极快）
+  build-by-arch:
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+            arch_tag: amd64
+          - runner: ubuntu-24.04-arm # 使用 GitHub 官方原生 ARM64 机器！
+            platform: linux/arm64
+            arch_tag: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout docker repo
+        uses: actions/checkout@v4
+
+      - name: Clone SmartDNS source
         run: |
-          set -e
-          rm -rf src
-          git clone --depth 1 --branch "${{ steps.ver.outputs.version }}" \
+          git clone --depth 1 --branch "${{ needs.prepare.outputs.version }}" \
             "https://github.com/${UPSTREAM_REPO}.git" src
-
-      - name: Inject Dockerfile and preset config into build context
-        run: |
-          set -e
           cp Dockerfile src/Dockerfile
-          rm -rf src/smartdns
           cp -r smartdns src/smartdns
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 将用户名转为全小写，防止 GHCR 因大写字母报错
       - name: Set lower case owner name
-        run: |
-          echo "OWNER_LC=${OWNER,,}" >> "${GITHUB_ENV}"
+        run: echo "OWNER_LC=${OWNER,,}" >> "${GITHUB_ENV}"
         env:
           OWNER: '${{ github.repository_owner }}'
 
@@ -106,34 +95,77 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push (linux/amd64, linux/arm64)
+      # 启用 GHA 缓存，加快构建速度
+      - name: Build and push by digest
         uses: docker/build-push-action@v6
         with:
           context: src
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platform }}
           push: true
           build-args: |
-            SMARTDNS_VERSION=${{ steps.ver.outputs.version }}
+            SMARTDNS_VERSION=${{ needs.prepare.outputs.version }}
           tags: |
-            ghcr.io/${{ env.OWNER_LC }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.version }}
-            ghcr.io/${{ env.OWNER_LC }}/${{ env.IMAGE_NAME }}:latest
+            ghcr.io/${{ env.OWNER_LC }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.version }}-${{ matrix.arch_tag }}
+          cache-from: type=gha,scope=${{ matrix.arch_tag }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch_tag }}
 
-      - name: Record last built version
+  # 步骤 3：合并两个架构的 Tag，生成 Multi-Arch 镜像及 latest 标签
+  merge-tags:
+    needs: [prepare, build-by-arch]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout docker repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set lower case owner name
+        run: echo "OWNER_LC=${OWNER,,}" >> "${GITHUB_ENV}"
+        env:
+          OWNER: '${{ github.repository_owner }}'
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifest
         run: |
-          echo -n "${{ steps.ver.outputs.version }}" > "$LAST_VERSION_FILE"
+          VERSION="${{ needs.prepare.outputs.version }}"
+          REPO="ghcr.io/${{ env.OWNER_LC }}/${{ env.IMAGE_NAME }}"
 
-      - name: Commit version record back to repo
+          # 创建版本 Manifest 并推送
+          docker buildx imagetools create -t ${REPO}:${VERSION} \
+            ${REPO}:${VERSION}-amd64 \
+            ${REPO}:${VERSION}-arm64
+
+          # 创建 latest Manifest 并推送
+          docker buildx imagetools create -t ${REPO}:latest \
+            ${REPO}:${VERSION}-amd64 \
+            ${REPO}:${VERSION}-arm64
+
+      # 记录最新构建的版本并提交
+      - name: Record and Commit version
         run: |
           set -e
+          mkdir -p "$(dirname "$LAST_VERSION_FILE")"
+          echo -n "${{ needs.prepare.outputs.version }}" > "$LAST_VERSION_FILE"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           git add "$LAST_VERSION_FILE"
-
           if git diff --staged --quiet; then
             echo "版本记录无变化，跳过提交"
           else
-            git commit -m "chore: update last built smartdns version to ${{ steps.ver.outputs.version }}"
+            git commit -m "chore: update last built smartdns version to ${{ needs.prepare.outputs.version }}"
             git fetch origin main
             git rebase origin/main
             git push origin HEAD:main
