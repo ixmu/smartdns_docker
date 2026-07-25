@@ -17,7 +17,7 @@ podman run -d \
   docker.io/xlousp/smartdns:latest
 ```
 
-方案 B: Host 网络模式 (推荐网关/旁路由环境)
+**方案 B: Host 网络模式 (推荐网关/旁路由环境)**
 
 ```
 podman run -d \
